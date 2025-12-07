@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Sprite Sheet Processor</title>
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady()"></script>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #1a1a1a; color: #fff; }
+    canvas { border: 1px solid #333; margin: 10px; }
+    .hidden { display: none; }
+    #status { padding: 10px; background: #333; margin-bottom: 20px; }
+  </style>
+</head>
+<body>
+  <div id="status">Loading OpenCV.js...</div>
+
+  <canvas id="inputCanvas" class="hidden"></canvas>
+  <canvas id="outputCanvas" class="hidden"></canvas>
+  <canvas id="debugCanvas"></canvas>
+
+  <script>
+    let cvReady = false;
+
+    function onOpenCvReady() {
+      cvReady = true;
+      document.getElementById('status').textContent = 'OpenCV.js ready';
+      window.opencvReady = true;
+    }
+
+    // Wait for OpenCV to be ready
+    function waitForOpenCV() {
+      return new Promise((resolve) => {
+        if (cvReady) {
+          resolve();
+        } else {
+          const check = setInterval(() => {
+            if (cvReady) {
+              clearInterval(check);
+              resolve();
+            }
+          }, 100);
+        }
+      });
+    }
+
+    /**
+     * Load image from base64 data URL into canvas
+     */
+    function loadImageToCanvas(dataUrl) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.getElementById('inputCanvas');
+          canvas.width = img.width;
+          canvas.height = img.height;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0);
+          resolve({ width: img.width, height: img.height });
+        };
+        img.onerror = reject;
+        img.src = dataUrl;
+      });
+    }
+
+    /**
+     * Detect sprite frames using OpenCV contour detection
+     */
+    async function detectFrames(options = {}) {
+      await waitForOpenCV();
+
+      const { method = 'auto', debug = false } = options;
+
+      const canvas = document.getElementById('inputCanvas');
+      const src = cv.imread(canvas);
+
+      // Convert to grayscale
+      const gray = new cv.Mat();
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+      // Extract alpha channel for transparency-based detection
+      const channels = new cv.MatVector();
+      cv.split(src, channels);
+      const alpha = channels.get(3);
+
+      // Threshold alpha channel to get binary mask
+      const binary = new cv.Mat();
+      cv.threshold(alpha, binary, 10, 255, cv.THRESH_BINARY);
+
+      // Apply morphological operations to clean up
+      const kernel = cv.Mat.ones(3, 3, cv.CV_8U);
+      const cleaned = new cv.Mat();
+      cv.morphologyEx(binary, cleaned, cv.MORPH_CLOSE, kernel);
+      cv.morphologyEx(cleaned, cleaned, cv.MORPH_OPEN, kernel);
+
+      // Find contours
+      const contours = new cv.MatVector();
+      const hierarchy = new cv.Mat();
+      cv.findContours(cleaned, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+      // Get bounding rectangles for each contour
+      const frames = [];
+      for (let i = 0; i < contours.size(); i++) {
+        const contour = contours.get(i);
+        const rect = cv.boundingRect(contour);
+
+        // Filter out tiny regions (noise)
+        if (rect.width > 10 && rect.height > 10) {
+          frames.push({
+            x: rect.x,
+            y: rect.y,
+            width: rect.width,
+            height: rect.height,
+            area: rect.width * rect.height
+          });
+        }
+      }
+
+      // Sort frames: top-to-bottom, left-to-right
+      frames.sort((a, b) => {
+        // Group by row (allow 20px tolerance)
+        const rowA = Math.floor(a.y / 20);
+        const rowB = Math.floor(b.y / 20);
+        if (rowA !== rowB) return rowA - rowB;
+        return a.x - b.x;
+      });
+
+      // Try to detect if this is a uniform grid
+      const gridInfo = analyzeGrid(frames, src.cols, src.rows);
+
+      // Draw debug visualization if requested
+      if (debug) {
+        const debugCanvas = document.getElementById('debugCanvas');
+        debugCanvas.width = src.cols;
+        debugCanvas.height = src.rows;
+
+        // Draw original with detected frames
+        cv.imshow('debugCanvas', src);
+        const ctx = debugCanvas.getContext('2d');
+        ctx.strokeStyle = '#00ff00';
+        ctx.lineWidth = 2;
+        ctx.font = '14px monospace';
+        ctx.fillStyle = '#00ff00';
+
+        frames.forEach((frame, i) => {
+          ctx.strokeRect(frame.x, frame.y, frame.width, frame.height);
+          ctx.fillText(`${i}`, frame.x + 5, frame.y + 15);
+        });
+      }
+
+      // Cleanup
+      src.delete();
+      gray.delete();
+      alpha.delete();
+      binary.delete();
+      cleaned.delete();
+      kernel.delete();
+      contours.delete();
+      hierarchy.delete();
+      channels.delete();
+
+      return {
+        frames,
+        gridInfo,
+        imageWidth: canvas.width,
+        imageHeight: canvas.height,
+        method: 'opencv-contours'
+      };
+    }
+
+    /**
+     * Analyze if frames form a uniform grid
+     */
+    function analyzeGrid(frames, imageWidth, imageHeight) {
+      if (frames.length < 2) {
+        return { isUniform: false, rows: 1, cols: frames.length };
+      }
+
+      // Check if all frames are similar size
+      const avgWidth = frames.reduce((sum, f) => sum + f.width, 0) / frames.length;
+      const avgHeight = frames.reduce((sum, f) => sum + f.height, 0) / frames.length;
+
+      const widthVariance = frames.reduce((sum, f) => sum + Math.pow(f.width - avgWidth, 2), 0) / frames.length;
+      const heightVariance = frames.reduce((sum, f) => sum + Math.pow(f.height - avgHeight, 2), 0) / frames.length;
+
+      const isUniformSize = Math.sqrt(widthVariance) < avgWidth * 0.1 &&
+                           Math.sqrt(heightVariance) < avgHeight * 0.1;
+
+      // Estimate grid dimensions
+      const cols = Math.round(imageWidth / avgWidth);
+      const rows = Math.round(imageHeight / avgHeight);
+
+      // Check if frame positions align to a grid
+      let isAligned = true;
+      const expectedCellWidth = imageWidth / cols;
+      const expectedCellHeight = imageHeight / rows;
+
+      for (const frame of frames) {
+        const expectedCol = Math.round(frame.x / expectedCellWidth);
+        const expectedRow = Math.round(frame.y / expectedCellHeight);
+        const expectedX = expectedCol * expectedCellWidth;
+        const expectedY = expectedRow * expectedCellHeight;
+
+        if (Math.abs(frame.x - expectedX) > 20 || Math.abs(frame.y - expectedY) > 20) {
+          isAligned = false;
+          break;
+        }
+      }
+
+      return {
+        isUniform: isUniformSize && isAligned,
+        rows,
+        cols,
+        avgFrameWidth: Math.round(avgWidth),
+        avgFrameHeight: Math.round(avgHeight),
+        frameCount: frames.length
+      };
+    }
+
+    /**
+     * Alternative: Detect frames using line detection for grid-based sheets
+     */
+    async function detectGrid(options = {}) {
+      await waitForOpenCV();
+
+      const canvas = document.getElementById('inputCanvas');
+      const src = cv.imread(canvas);
+      const width = src.cols;
+      const height = src.rows;
+
+      // Extract alpha channel
+      const channels = new cv.MatVector();
+      cv.split(src, channels);
+      const alpha = channels.get(3);
+
+      // Find columns that are fully transparent (vertical dividers)
+      const verticalDividers = [];
+      for (let x = 0; x < width; x++) {
+        let isTransparent = true;
+        for (let y = 0; y < height; y++) {
+          if (alpha.ucharPtr(y, x)[0] > 10) {
+            isTransparent = false;
+            break;
+          }
+        }
+        if (isTransparent) {
+          verticalDividers.push(x);
+        }
+      }
+
+      // Find rows that are fully transparent (horizontal dividers)
+      const horizontalDividers = [];
+      for (let y = 0; y < height; y++) {
+        let isTransparent = true;
+        for (let x = 0; x < width; x++) {
+          if (alpha.ucharPtr(y, x)[0] > 10) {
+            isTransparent = false;
+            break;
+          }
+        }
+        if (isTransparent) {
+          horizontalDividers.push(y);
+        }
+      }
+
+      // Cleanup
+      src.delete();
+      alpha.delete();
+      channels.delete();
+
+      // Group consecutive dividers into ranges
+      const vRanges = groupConsecutive(verticalDividers);
+      const hRanges = groupConsecutive(horizontalDividers);
+
+      // Calculate frame boundaries
+      const xBoundaries = [0, ...vRanges.map(r => Math.floor((r.start + r.end) / 2)), width];
+      const yBoundaries = [0, ...hRanges.map(r => Math.floor((r.start + r.end) / 2)), height];
+
+      const frames = [];
+      for (let row = 0; row < yBoundaries.length - 1; row++) {
+        for (let col = 0; col < xBoundaries.length - 1; col++) {
+          frames.push({
+            x: xBoundaries[col],
+            y: yBoundaries[row],
+            width: xBoundaries[col + 1] - xBoundaries[col],
+            height: yBoundaries[row + 1] - yBoundaries[row]
+          });
+        }
+      }
+
+      return {
+        frames,
+        gridInfo: {
+          isUniform: true,
+          rows: yBoundaries.length - 1,
+          cols: xBoundaries.length - 1
+        },
+        imageWidth: width,
+        imageHeight: height,
+        method: 'opencv-grid'
+      };
+    }
+
+    /**
+     * Group consecutive numbers into ranges
+     */
+    function groupConsecutive(numbers) {
+      if (numbers.length === 0) return [];
+
+      const ranges = [];
+      let start = numbers[0];
+      let end = numbers[0];
+
+      for (let i = 1; i < numbers.length; i++) {
+        if (numbers[i] === end + 1) {
+          end = numbers[i];
+        } else {
+          if (end - start > 2) { // Only count as divider if wide enough
+            ranges.push({ start, end });
+          }
+          start = numbers[i];
+          end = numbers[i];
+        }
+      }
+
+      if (end - start > 2) {
+        ranges.push({ start, end });
+      }
+
+      return ranges;
+    }
+
+    /**
+     * Main detection function - tries multiple methods
+     */
+    async function analyzeSprite(dataUrl, options = {}) {
+      await loadImageToCanvas(dataUrl);
+
+      // Try contour detection first
+      const contourResult = await detectFrames(options);
+
+      // If contours found reasonable frames, use them
+      if (contourResult.frames.length >= 2) {
+        return contourResult;
+      }
+
+      // Fall back to grid detection
+      const gridResult = await detectGrid(options);
+
+      if (gridResult.frames.length >= 2) {
+        return gridResult;
+      }
+
+      // If all else fails, return contour result
+      return contourResult;
+    }
+
+    /**
+     * Generate a visual validation image showing detected frames
+     * Returns base64 PNG with green boxes around each detected frame
+     */
+    async function generateValidationImage(dataUrl, frames) {
+      await loadImageToCanvas(dataUrl);
+
+      const inputCanvas = document.getElementById('inputCanvas');
+      const debugCanvas = document.getElementById('debugCanvas');
+
+      debugCanvas.width = inputCanvas.width;
+      debugCanvas.height = inputCanvas.height;
+
+      const ctx = debugCanvas.getContext('2d');
+
+      // Draw original image
+      ctx.drawImage(inputCanvas, 0, 0);
+
+      // Draw frame boxes
+      ctx.strokeStyle = '#00ff00';
+      ctx.lineWidth = 3;
+      ctx.font = 'bold 16px monospace';
+      ctx.fillStyle = '#00ff00';
+
+      frames.forEach((frame, i) => {
+        // Draw rectangle
+        ctx.strokeRect(frame.x, frame.y, frame.width, frame.height);
+
+        // Draw frame number with background
+        const label = `${i}`;
+        const labelX = frame.x + 5;
+        const labelY = frame.y + 20;
+
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+        ctx.fillRect(labelX - 2, labelY - 14, 20, 18);
+        ctx.fillStyle = '#00ff00';
+        ctx.fillText(label, labelX, labelY);
+      });
+
+      // Return as base64
+      return debugCanvas.toDataURL('image/png');
+    }
+
+    /**
+     * Extract a single frame and return as base64
+     */
+    async function extractFramePreview(dataUrl, frame, index) {
+      await loadImageToCanvas(dataUrl);
+
+      const inputCanvas = document.getElementById('inputCanvas');
+      const outputCanvas = document.getElementById('outputCanvas');
+
+      outputCanvas.width = frame.width;
+      outputCanvas.height = frame.height;
+
+      const ctx = outputCanvas.getContext('2d');
+      ctx.drawImage(
+        inputCanvas,
+        frame.x, frame.y, frame.width, frame.height,
+        0, 0, frame.width, frame.height
+      );
+
+      return outputCanvas.toDataURL('image/png');
+    }
+
+    // Expose functions globally for Puppeteer
+    window.analyzeSprite = analyzeSprite;
+    window.detectFrames = detectFrames;
+    window.detectGrid = detectGrid;
+    window.loadImageToCanvas = loadImageToCanvas;
+    window.generateValidationImage = generateValidationImage;
+    window.extractFramePreview = extractFramePreview;
+  </script>
+</body>
+</html>
